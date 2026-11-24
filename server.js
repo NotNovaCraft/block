@@ -1,0 +1,548 @@
+import crypto from 'node:crypto';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import { WebSocketServer } from 'ws';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const propsPath = path.join(__dirname, 'server.properties.json');
+const props = JSON.parse(fs.readFileSync(propsPath, 'utf8'));
+
+const PORT = Number(process.env.PORT || 3000);
+const SERVER_NAME = process.env.SERVER_NAME || props.serverName || 'My Blocks Server';
+const MOTD = process.env.MOTD || props.motd || 'Welcome to Blocks!';
+const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || props.maxPlayers || 24);
+const ALLOW_BUILDING = props.allowBuilding !== false;
+const OWNER_KEY = String(process.env.BLOCKS_OWNER_KEY || props.ownerKey || '').trim();
+const WORLDS = Array.isArray(props.worlds) && props.worlds.length > 0 ? props.worlds : [];
+
+function verifyOwnerKey(candidate) {
+  if (!OWNER_KEY || typeof candidate !== 'string' || !candidate.trim()) return false;
+  const a = crypto.createHash('sha256').update(candidate.trim()).digest();
+  const b = crypto.createHash('sha256').update(OWNER_KEY).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+const app = express();
+app.use(express.json());
+
+// Allow any Blocks client to query this public server info & connect
+app.use('/api/server-info', (_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (_req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+const clients = new Map(); // id -> { ws, player, isOwner, failedAuth }
+const worldBlocks = new Map(); // worldId -> Map<key, block>
+const tagHolders = new Map(); // worldId -> playerId | null
+const chatHistory = [];
+
+for (const w of WORLDS) {
+  worldBlocks.set(w.id, new Map());
+  if (w.mode === 'tag') tagHolders.set(w.id, null);
+}
+
+function getWorldPlayers(worldId) {
+  const list = [];
+  for (const c of clients.values()) {
+    if (c.player.worldId === worldId) list.push(c.player);
+  }
+  return list;
+}
+
+function getServerInfo() {
+  return {
+    serverName: SERVER_NAME,
+    motd: MOTD,
+    version: props.version || '1.0.0',
+    onlinePlayers: clients.size,
+    maxPlayers: MAX_PLAYERS,
+    allowBuilding: ALLOW_BUILDING,
+    ownerAuthEnabled: Boolean(OWNER_KEY),
+    worlds: WORLDS.map((w) => ({
+      id: w.id,
+      name: w.name,
+      description: w.description,
+      mode: w.mode,
+      accentColor: w.accentColor,
+      playerCount: getWorldPlayers(w.id).length,
+    })),
+  };
+}
+
+function sanitizeUsername(raw) {
+  const clean = String(raw || 'Player')
+    .replace(/[^a-zA-Z0-9 _-]/g, '')
+    .trim()
+    .slice(0, 18);
+  const base = clean.length >= 2 ? clean : 'Player';
+  const existing = new Set([...clients.values()].map((c) => c.player.username.toLowerCase()));
+  if (!existing.has(base.toLowerCase())) return base;
+  let n = 2;
+  while (existing.has((base + ' ' + n).toLowerCase())) n++;
+  return (base + ' ' + n).slice(0, 20);
+}
+
+function sendTo(ws, payload) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(payload));
+}
+
+function broadcastAll(payload, excludeId = null) {
+  const raw = JSON.stringify(payload);
+  for (const [id, c] of clients.entries()) {
+    if (id !== excludeId && c.ws.readyState === 1) c.ws.send(raw);
+  }
+}
+
+function broadcastWorld(worldId, payload, excludeId = null) {
+  const raw = JSON.stringify(payload);
+  for (const [id, c] of clients.entries()) {
+    if (id !== excludeId && c.player.worldId === worldId && c.ws.readyState === 1) {
+      c.ws.send(raw);
+    }
+  }
+}
+
+function pushChat(sender, text, system = false, worldId = undefined) {
+  const msg = {
+    id: Math.random().toString(36).slice(2, 10),
+    sender,
+    text: String(text).slice(0, 200),
+    system,
+    worldId,
+    timestamp: Date.now(),
+  };
+  chatHistory.push(msg);
+  if (chatHistory.length > 60) chatHistory.shift();
+  broadcastAll({ type: 'chat:message', message: msg });
+}
+
+function assignTagIfNeeded(worldId) {
+  const w = WORLDS.find((x) => x.id === worldId);
+  if (!w || w.mode !== 'tag') return;
+  const current = tagHolders.get(worldId);
+  const inWorld = getWorldPlayers(worldId);
+  if (inWorld.length === 0) {
+    tagHolders.set(worldId, null);
+    return;
+  }
+  if (!current || !inWorld.some((p) => p.id === current)) {
+    const next = inWorld[0];
+    tagHolders.set(worldId, next.id);
+    broadcastWorld(worldId, { type: 'tag:update', tagHolderId: next.id });
+    pushChat('Server', next.username + ' is IT!', true, worldId);
+  }
+}
+
+app.get('/api/server-info', (_req, res) => {
+  res.json(getServerInfo());
+});
+
+app.get('/', (_req, res) => {
+  const info = getServerInfo();
+  const safeName = info.serverName.replace(/[<>&]/g, '');
+  const safeMotd = info.motd.replace(/[<>&]/g, '');
+  res.type('html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>${safeName}</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0e17;color:#eef2fb;display:grid;place-items:center;min-height:100vh;margin:0}
+.box{max-width:460px;padding:28px;border-radius:16px;background:#131826;border:1px solid #26304a}
+code{background:#1b2236;padding:3px 7px;border-radius:6px}</style></head>
+<body><div class="box">
+<h1>${safeName}</h1>
+<p>${safeMotd}</p>
+<p>Players online: <b>${info.onlinePlayers} / ${info.maxPlayers}</b></p>
+<p>Worlds hosted: <b>${info.worlds.map((w) => w.name).join(', ')}</b></p>
+<p>Paste this page's URL into <b>Blocks Multiplayer &rarr; Server Address</b> to join!</p>
+</div></body></html>`);
+});
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (url.pathname === '/ws' || url.pathname === '/') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on('connection', (ws) => {
+  if (clients.size >= MAX_PLAYERS) {
+    sendTo(ws, { type: 'error', message: 'Server is full (' + MAX_PLAYERS + ' max players).' });
+    ws.close();
+    return;
+  }
+
+  let clientId = null;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+
+    if (msg.type === 'hello' && !clientId) {
+      clientId = Math.random().toString(36).slice(2, 10);
+      const defaultWorld = WORLDS[0]?.id || 'baseplate';
+      const world = WORLDS.find((w) => w.id === msg.worldId) || WORLDS[0];
+      const worldId = world ? world.id : defaultWorld;
+      const spawn = world?.spawn || [0, 0.7, 0];
+
+      const player = {
+        id: clientId,
+        username: sanitizeUsername(msg.username),
+        worldId,
+        x: spawn[0],
+        y: spawn[1],
+        z: spawn[2],
+        ry: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        ground: true,
+        moving: false,
+        avatar: {
+          bodyColor: String(msg.avatar?.bodyColor || '#9fa1d6').slice(0, 16),
+          headItem: msg.avatar?.headItem || null,
+          backItem: msg.avatar?.backItem || null,
+        },
+      };
+
+      clients.set(clientId, { ws, player, isOwner: false, failedAuth: 0 });
+
+      sendTo(ws, {
+        type: 'welcome',
+        playerId: clientId,
+        username: player.username,
+        serverInfo: getServerInfo(),
+        worlds: WORLDS,
+        worldState: {
+          worldId,
+          players: getWorldPlayers(worldId),
+          placedBlocks: [...(worldBlocks.get(worldId)?.values() || [])],
+          tagHolderId: tagHolders.get(worldId) || null,
+        },
+        chatHistory,
+      });
+
+      broadcastWorld(worldId, { type: 'player:joined', player }, clientId);
+      broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
+      pushChat('Server', player.username + ' joined the server.', true);
+      assignTagIfNeeded(worldId);
+      return;
+    }
+
+    if (!clientId || !clients.has(clientId)) return;
+    const client = clients.get(clientId);
+    const player = client.player;
+
+    if (msg.type === 'player:move') {
+      player.x = Number(msg.x) || 0;
+      player.y = Number(msg.y) || 0;
+      player.z = Number(msg.z) || 0;
+      player.ry = Number(msg.ry) || 0;
+      player.vx = Number(msg.vx) || 0;
+      player.vy = Number(msg.vy) || 0;
+      player.vz = Number(msg.vz) || 0;
+      player.ground = Boolean(msg.ground);
+      player.moving = Boolean(msg.moving);
+      broadcastWorld(player.worldId, { type: 'player:moved', player }, clientId);
+    } else if (msg.type === 'player:avatar') {
+      player.avatar = {
+        bodyColor: String(msg.avatar?.bodyColor || '#9fa1d6').slice(0, 16),
+        headItem: msg.avatar?.headItem || null,
+        backItem: msg.avatar?.backItem || null,
+      };
+      broadcastWorld(
+        player.worldId,
+        { type: 'player:avatar', id: clientId, avatar: player.avatar },
+        clientId
+      );
+    } else if (msg.type === 'world:switch') {
+      const target = WORLDS.find((w) => w.id === msg.worldId);
+      if (!target) return;
+      const oldWorldId = player.worldId;
+      if (oldWorldId === target.id) return;
+
+      broadcastWorld(oldWorldId, { type: 'player:left', id: clientId }, clientId);
+      player.worldId = target.id;
+      player.x = target.spawn[0];
+      player.y = target.spawn[1];
+      player.z = target.spawn[2];
+      player.vx = player.vy = player.vz = 0;
+
+      assignTagIfNeeded(oldWorldId);
+      assignTagIfNeeded(target.id);
+
+      sendTo(ws, {
+        type: 'world:state',
+        worldState: {
+          worldId: target.id,
+          players: getWorldPlayers(target.id),
+          placedBlocks: [...(worldBlocks.get(target.id)?.values() || [])],
+          tagHolderId: tagHolders.get(target.id) || null,
+        },
+      });
+      broadcastWorld(target.id, { type: 'player:joined', player }, clientId);
+      broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
+      pushChat('Server', player.username + ' entered ' + target.name + '.', true);
+    } else if (msg.type === 'owner:auth') {
+      if (!OWNER_KEY) {
+        sendTo(ws, { type: 'owner:status', isOwner: false, error: 'Live owner login is disabled. Edit server.properties.json or set BLOCKS_OWNER_KEY.' });
+        return;
+      }
+      if (client.failedAuth >= 5) {
+        sendTo(ws, { type: 'owner:status', isOwner: false, error: 'Too many failed passkey attempts.' });
+        return;
+      }
+      if (verifyOwnerKey(msg.key)) {
+        client.isOwner = true;
+        client.failedAuth = 0;
+        sendTo(ws, { type: 'owner:status', isOwner: true });
+      } else {
+        client.failedAuth++;
+        sendTo(ws, { type: 'owner:status', isOwner: false, error: 'Incorrect owner passkey.' });
+      }
+    } else if (msg.type === 'world:create') {
+      if (!client.isOwner) {
+        sendTo(ws, { type: 'error', message: 'Only the server owner can add custom games.' });
+        return;
+      }
+      if (WORLDS.length >= 16 || typeof msg.world !== 'object' || !msg.world) return;
+      const w = msg.world;
+      const name = String(w.name || '').replace(/[\r\n<>]/g, '').trim().slice(0, 36);
+      if (name.length < 2) return;
+      const existingIds = new Set(WORLDS.map((x) => x.id));
+      let id = (String(w.id || name).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '').slice(0, 28)) || 'custom-game';
+      let n = 2;
+      while (existingIds.has(id)) id = id + '-' + n++;
+      const hex = (v, fb) => /^#[0-9a-fA-F]{6}$/.test(String(v || '')) ? String(v) : fb;
+      const clp = (v, mn, mx, fb) => Number.isFinite(Number(v)) ? Math.max(mn, Math.min(mx, Number(v))) : fb;
+      const boxes = (Array.isArray(w.boxes) ? w.boxes.slice(0, 300) : []).map((b) => ({
+        x: clp(b.x, -145, 145, 0),
+        y: clp(b.y, -20, 120, 0),
+        z: clp(b.z, -145, 145, 0),
+        w: clp(b.w, 0.5, 120, 3),
+        h: clp(b.h, 0.2, 80, 3),
+        d: clp(b.d, 0.5, 120, 3),
+        color: hex(b.color, '#4c7dff'),
+      }));
+      const sp = Array.isArray(w.spawn) ? w.spawn : [0, 1, 0];
+      const newWorld = {
+        id,
+        name,
+        description: String(w.description || 'Custom game').replace(/[\r\n<>]/g, '').trim().slice(0, 120) || 'Custom game',
+        mode: w.mode === 'obby' || w.mode === 'tag' ? w.mode : 'sandbox',
+        skyColor: hex(w.skyColor, '#87b9e8'),
+        fogColor: hex(w.fogColor, hex(w.skyColor, '#87b9e8')),
+        accentColor: hex(w.accentColor, '#4c7dff'),
+        spawn: [clp(sp[0], -140, 140, 0), clp(sp[1], 0.5, 100, 1), clp(sp[2], -140, 140, 0)],
+        ...(Array.isArray(w.goal) && w.goal.length === 3 ? { goal: [clp(w.goal[0], -140, 140, 0), clp(w.goal[1], 0, 120, 10), clp(w.goal[2], -140, 140, -30)] } : {}),
+        hasBaseplate: w.hasBaseplate !== false,
+        boxes,
+      };
+      WORLDS.push(newWorld);
+      worldBlocks.set(newWorld.id, new Map());
+      if (newWorld.mode === 'tag') tagHolders.set(newWorld.id, null);
+      broadcastAll({ type: 'world:added', world: newWorld, serverInfo: getServerInfo() });
+      pushChat('Server', 'Owner ' + player.username + ' added custom game "' + newWorld.name + '"!', true);
+    } else if (msg.type === 'world:delete') {
+      if (!client.isOwner) {
+        sendTo(ws, { type: 'error', message: 'Only the server owner can remove games.' });
+        return;
+      }
+      if (WORLDS.length <= 1) {
+        sendTo(ws, { type: 'error', message: 'Server must keep at least 1 game.' });
+        return;
+      }
+      const idx = WORLDS.findIndex((w) => w.id === msg.worldId);
+      if (idx === -1) return;
+      const [removed] = WORLDS.splice(idx, 1);
+      worldBlocks.delete(removed.id);
+      tagHolders.delete(removed.id);
+      const fallback = WORLDS[0];
+      for (const c of clients.values()) {
+        if (c.player.worldId === removed.id) {
+          c.player.worldId = fallback.id;
+          c.player.x = fallback.spawn[0];
+          c.player.y = fallback.spawn[1];
+          c.player.z = fallback.spawn[2];
+          sendTo(c.ws, {
+            type: 'world:state',
+            worldState: {
+              worldId: fallback.id,
+              players: getWorldPlayers(fallback.id),
+              placedBlocks: [...(worldBlocks.get(fallback.id)?.values() || [])],
+              tagHolderId: tagHolders.get(fallback.id) || null,
+            },
+          });
+        }
+      }
+      broadcastAll({ type: 'world:removed', worldId: removed.id, fallbackWorldId: fallback.id, serverInfo: getServerInfo() });
+      pushChat('Server', 'Owner ' + player.username + ' removed game "' + removed.name + '".', true);
+    } else if (msg.type === 'block:place' && ALLOW_BUILDING) {
+      const blocksMap = worldBlocks.get(player.worldId);
+      if (!blocksMap || blocksMap.size >= 800) return;
+      const x = Math.round(Number(msg.x) / 3) * 3;
+      const y = Math.max(0, Math.min(90, Math.round(Number(msg.y) / 3) * 3));
+      const z = Math.round(Number(msg.z) / 3) * 3;
+      if (Math.abs(x) > 140 || Math.abs(z) > 140) return;
+      const key = x + ',' + y + ',' + z;
+      const block = {
+        key,
+        x,
+        y,
+        z,
+        color: String(msg.color || '#4c7dff').slice(0, 16),
+        owner: player.username,
+      };
+      blocksMap.set(key, block);
+      broadcastWorld(player.worldId, { type: 'block:placed', worldId: player.worldId, block });
+    } else if (msg.type === 'block:break' && ALLOW_BUILDING) {
+      const blocksMap = worldBlocks.get(player.worldId);
+      if (!blocksMap) return;
+      const key = String(msg.key || '');
+      if (blocksMap.delete(key)) {
+        broadcastWorld(player.worldId, { type: 'block:removed', worldId: player.worldId, key });
+      }
+    } else if (msg.type === 'tag:bump') {
+      const world = WORLDS.find((w) => w.id === player.worldId);
+      if (!world || world.mode !== 'tag') return;
+      if (tagHolders.get(player.worldId) !== clientId) return;
+      const target = clients.get(String(msg.targetId || ''));
+      if (!target || target.player.worldId !== player.worldId) return;
+      const dist = Math.hypot(
+        player.x - target.player.x,
+        player.y - target.player.y,
+        player.z - target.player.z
+      );
+      if (dist <= 4.5) {
+        tagHolders.set(player.worldId, target.player.id);
+        broadcastWorld(player.worldId, { type: 'tag:update', tagHolderId: target.player.id });
+        pushChat('Server', target.player.username + ' was tagged by ' + player.username + '!', true, player.worldId);
+      }
+    } else if (msg.type === 'chat:send') {
+      const text = String(msg.text || '').trim().slice(0, 200);
+      if (!text) return;
+
+      if (text.startsWith('/')) {
+        const [cmd, ...args] = text.slice(1).split(' ');
+        const lc = cmd.toLowerCase();
+        if (lc === 'help') {
+          sendTo(ws, {
+            type: 'chat:message',
+            message: {
+              id: Math.random().toString(36).slice(2),
+              sender: 'Server',
+              text: 'Commands: /list, /tp <player>, /spawn, /me <action>, /help',
+              system: true,
+              timestamp: Date.now(),
+            },
+          });
+        } else if (lc === 'list') {
+          const names = [...clients.values()]
+            .map((c) => c.player.username + ' (' + c.player.worldId + ')')
+            .join(', ');
+          sendTo(ws, {
+            type: 'chat:message',
+            message: {
+              id: Math.random().toString(36).slice(2),
+              sender: 'Server',
+              text: 'Online (' + clients.size + '/' + MAX_PLAYERS + '): ' + names,
+              system: true,
+              timestamp: Date.now(),
+            },
+          });
+        } else if (lc === 'tp') {
+          const query = args.join(' ').trim().toLowerCase();
+          const target = [...clients.values()].find(
+            (c) => c.player.id !== clientId && c.player.username.toLowerCase().includes(query)
+          );
+          if (target && target.player.worldId === player.worldId) {
+            sendTo(ws, {
+              type: 'player:teleport',
+              x: target.player.x,
+              y: target.player.y + 1,
+              z: target.player.z + 2,
+            });
+          } else {
+            sendTo(ws, {
+              type: 'chat:message',
+              message: {
+                id: Math.random().toString(36).slice(2),
+                sender: 'Server',
+                text: 'Player not found in your current world.',
+                system: true,
+                timestamp: Date.now(),
+              },
+            });
+          }
+        } else if (lc === 'spawn') {
+          const w = WORLDS.find((x) => x.id === player.worldId);
+          const sp = w?.spawn || [0, 0.7, 0];
+          sendTo(ws, { type: 'player:teleport', x: sp[0], y: sp[1], z: sp[2] });
+        } else if (lc === 'me') {
+          pushChat('Server', '* ' + player.username + ' ' + args.join(' '), true);
+        }
+        return;
+      }
+
+      pushChat(player.username, text, false, player.worldId);
+    }
+  });
+
+  ws.on('close', () => {
+    if (!clientId || !clients.has(clientId)) return;
+    const { player } = clients.get(clientId);
+    clients.delete(clientId);
+    broadcastWorld(player.worldId, { type: 'player:left', id: clientId });
+    broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
+    pushChat('Server', player.username + ' left the server.', true);
+    assignTagIfNeeded(player.worldId);
+  });
+});
+
+// Minecraft-style server console commands (list, say <msg>, kick <name>, clearblocks)
+if (process.stdin.isTTY) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  rl.on('line', (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const [cmd, ...args] = trimmed.split(' ');
+    if (cmd === 'list') {
+      console.log('Online:', [...clients.values()].map((c) => c.player.username).join(', ') || '(none)');
+    } else if (cmd === 'say') {
+      pushChat('Server', args.join(' '), true);
+    } else if (cmd === 'kick') {
+      const targetName = args.join(' ').toLowerCase();
+      for (const c of clients.values()) {
+        if (c.player.username.toLowerCase() === targetName) {
+          sendTo(c.ws, { type: 'error', message: 'Kicked by server console.' });
+          c.ws.close();
+        }
+      }
+    } else if (cmd === 'clearblocks') {
+      for (const [worldId, map] of worldBlocks.entries()) {
+        map.clear();
+        broadcastWorld(worldId, { type: 'world:blocks-cleared', worldId });
+      }
+      console.log('Cleared all placed blocks.');
+    }
+  });
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[${SERVER_NAME}] Blocks Multiplayer Server listening on port ${PORT}`);
+});
