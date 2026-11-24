@@ -1,9 +1,10 @@
 {
   "serverName": "Nova's Blocks Server",
-  "motd": "meow",
-  "maxPlayers": 24,
-  "allowBuilding": false,
-  "ownerKey": "3y0y0x2r2p6d1y",
+  "motd": "Official Block Server",
+  "maxPlayers": 100,
+  "allowBuilding": true,
+  "startingBalance": 0,
+  "ownerKey": "1v1z650c5z2u1j",
   "version": "1.0.0",
   "worlds": [
     {

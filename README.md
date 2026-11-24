@@ -40,4 +40,3 @@ Only you (the server owner) can add or remove custom games on your server:
 - `say <message>` — Broadcast a server announcement
 - `kick <player>` — Kick a player
 - `clearblocks` — Reset all player-placed blocks
-# block

@@ -16,8 +16,10 @@ const SERVER_NAME = process.env.SERVER_NAME || props.serverName || 'My Blocks Se
 const MOTD = process.env.MOTD || props.motd || 'Welcome to Blocks!';
 const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || props.maxPlayers || 24);
 const ALLOW_BUILDING = props.allowBuilding !== false;
+const STARTING_BALANCE = Math.max(0, Math.min(100000, Number(process.env.BLOCKS_STARTING_BALANCE ?? props.startingBalance ?? 1000)));
 const OWNER_KEY = String(process.env.BLOCKS_OWNER_KEY || props.ownerKey || '').trim();
 const WORLDS = Array.isArray(props.worlds) && props.worlds.length > 0 ? props.worlds : [];
+const CATALOG_META = [{"id":"crown","name":"Golden Crown","price":250,"slot":"head"},{"id":"tophat","name":"Top Hat","price":150,"slot":"head"},{"id":"ears","name":"Cat Ears","price":100,"slot":"head"},{"id":"halo","name":"Angel Halo","price":300,"slot":"head"},{"id":"wizard","name":"Wizard Hat","price":200,"slot":"head"},{"id":"phones","name":"Headphones","price":180,"slot":"head"},{"id":"pack","name":"Backpack","price":120,"slot":"back"},{"id":"wings","name":"Angel Wings","price":500,"slot":"back"}];
 
 function verifyOwnerKey(candidate) {
   if (!OWNER_KEY || typeof candidate !== 'string' || !candidate.trim()) return false;
@@ -25,6 +27,86 @@ function verifyOwnerKey(candidate) {
   const b = crypto.createHash('sha256').update(OWNER_KEY).digest();
   return crypto.timingSafeEqual(a, b);
 }
+
+const accountsPath = path.join(__dirname, 'server-accounts.json');
+const accounts = new Map();
+
+function sanitizeAvatar(raw, ownedItems) {
+  const obj = typeof raw === 'object' && raw !== null ? raw : {};
+  const c = String(obj.bodyColor || '#9fa1d6');
+  const bodyColor = /^#[0-9a-fA-F]{6}$/.test(c) ? c : '#9fa1d6';
+  const owned = ownedItems ? new Set(ownedItems) : null;
+  const rawHead = typeof obj.headItem === 'string' ? obj.headItem.slice(0, 24) : null;
+  const rawBack = typeof obj.backItem === 'string' ? obj.backItem.slice(0, 24) : null;
+  const headItem = rawHead && CATALOG_META.some((i) => i.id === rawHead && i.slot === 'head') && (!owned || owned.has(rawHead)) ? rawHead : null;
+  const backItem = rawBack && CATALOG_META.some((i) => i.id === rawBack && i.slot === 'back') && (!owned || owned.has(rawBack)) ? rawBack : null;
+  return { bodyColor, headItem, backItem };
+}
+
+function loadAccounts() {
+  if (!fs.existsSync(accountsPath)) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(accountsPath, 'utf8'));
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (v && typeof v.username === 'string' && typeof v.passwordHash === 'string') {
+        accounts.set(k.toLowerCase(), {
+          username: v.username,
+          passwordHash: v.passwordHash,
+          robux: Number.isFinite(Number(v.robux)) ? Number(v.robux) : STARTING_BALANCE,
+          ownedItems: Array.isArray(v.ownedItems) ? v.ownedItems.map(String) : [],
+          avatar: sanitizeAvatar(v.avatar),
+          createdAt: Number(v.createdAt) || Date.now(),
+          sessionHashes: Array.isArray(v.sessionHashes) ? v.sessionHashes.map(String).slice(-5) : [],
+        });
+      }
+    }
+  } catch {}
+}
+
+function saveAccounts() {
+  try {
+    const obj = {};
+    for (const [k, v] of accounts.entries()) obj[k] = v;
+    fs.writeFileSync(accountsPath, JSON.stringify(obj, null, 2), 'utf8');
+  } catch {}
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hex] = String(stored || '').split(':');
+  if (!salt || !hex) return false;
+  try {
+    const expected = Buffer.from(hex, 'hex');
+    const actual = crypto.scryptSync(password, salt, 64);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch { return false; }
+}
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function toPublicAccount(acc) {
+  return {
+    username: acc.username,
+    robux: acc.robux,
+    ownedItems: [...acc.ownedItems],
+    avatar: { ...acc.avatar },
+    createdAt: acc.createdAt,
+  };
+}
+
+function cleanAccountUsername(raw) {
+  const clean = String(raw || '').replace(/[^a-zA-Z0-9 _-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 18);
+  return clean.length >= 2 ? clean : null;
+}
+
+loadAccounts();
 
 const app = express();
 app.use(express.json());
@@ -38,7 +120,7 @@ app.use('/api/server-info', (_req, res, next) => {
   next();
 });
 
-const clients = new Map(); // id -> { ws, player, isOwner, failedAuth }
+const clients = new Map(); // id -> { ws, accountKey, player, isOwner, failedAuth, lastObbyRewardAt }
 const worldBlocks = new Map(); // worldId -> Map<key, block>
 const tagHolders = new Map(); // worldId -> playerId | null
 const chatHistory = [];
@@ -64,6 +146,7 @@ function getServerInfo() {
     onlinePlayers: clients.size,
     maxPlayers: MAX_PLAYERS,
     allowBuilding: ALLOW_BUILDING,
+    startingBalance: STARTING_BALANCE,
     ownerAuthEnabled: Boolean(OWNER_KEY),
     worlds: WORLDS.map((w) => ({
       id: w.id,
@@ -74,19 +157,6 @@ function getServerInfo() {
       playerCount: getWorldPlayers(w.id).length,
     })),
   };
-}
-
-function sanitizeUsername(raw) {
-  const clean = String(raw || 'Player')
-    .replace(/[^a-zA-Z0-9 _-]/g, '')
-    .trim()
-    .slice(0, 18);
-  const base = clean.length >= 2 ? clean : 'Player';
-  const existing = new Set([...clients.values()].map((c) => c.player.username.toLowerCase()));
-  if (!existing.has(base.toLowerCase())) return base;
-  let n = 2;
-  while (existing.has((base + ' ' + n).toLowerCase())) n++;
-  return (base + ' ' + n).slice(0, 20);
 }
 
 function sendTo(ws, payload) {
@@ -184,6 +254,66 @@ wss.on('connection', (ws) => {
   }
 
   let clientId = null;
+  let socketFailedAuth = 0;
+
+  sendTo(ws, { type: 'auth:required', serverInfo: getServerInfo() });
+
+  function completeLogin(accKey, acc, sessionToken, requestedWorldId) {
+    for (const [oldId, existing] of clients.entries()) {
+      if (existing.accountKey === accKey) {
+        clients.delete(oldId);
+        broadcastWorld(existing.player.worldId, { type: 'player:left', id: oldId });
+        sendTo(existing.ws, { type: 'error', message: 'Signed in from another session.' });
+        existing.ws.close();
+      }
+    }
+
+    clientId = Math.random().toString(36).slice(2, 10);
+    const defaultWorld = WORLDS[0]?.id || 'baseplate';
+    const world = WORLDS.find((w) => w.id === requestedWorldId) || WORLDS[0];
+    const worldId = world ? world.id : defaultWorld;
+    const spawn = world?.spawn || [0, 0.7, 0];
+
+    const player = {
+      id: clientId,
+      username: acc.username,
+      worldId,
+      x: spawn[0],
+      y: spawn[1],
+      z: spawn[2],
+      ry: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      ground: true,
+      moving: false,
+      avatar: { ...acc.avatar },
+    };
+
+    clients.set(clientId, { ws, accountKey: accKey, player, isOwner: false, failedAuth: 0, lastObbyRewardAt: 0 });
+
+    sendTo(ws, {
+      type: 'welcome',
+      playerId: clientId,
+      username: player.username,
+      sessionToken,
+      account: toPublicAccount(acc),
+      serverInfo: getServerInfo(),
+      worlds: WORLDS,
+      worldState: {
+        worldId,
+        players: getWorldPlayers(worldId),
+        placedBlocks: [...(worldBlocks.get(worldId)?.values() || [])],
+        tagHolderId: tagHolders.get(worldId) || null,
+      },
+      chatHistory,
+    });
+
+    broadcastWorld(worldId, { type: 'player:joined', player }, clientId);
+    broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
+    pushChat('Server', player.username + ' joined the server.', true);
+    assignTagIfNeeded(worldId);
+  }
 
   ws.on('message', (raw) => {
     let msg;
@@ -193,60 +323,84 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (msg.type === 'hello' && !clientId) {
-      clientId = Math.random().toString(36).slice(2, 10);
-      const defaultWorld = WORLDS[0]?.id || 'baseplate';
-      const world = WORLDS.find((w) => w.id === msg.worldId) || WORLDS[0];
-      const worldId = world ? world.id : defaultWorld;
-      const spawn = world?.spawn || [0, 0.7, 0];
-
-      const player = {
-        id: clientId,
-        username: sanitizeUsername(msg.username),
-        worldId,
-        x: spawn[0],
-        y: spawn[1],
-        z: spawn[2],
-        ry: 0,
-        vx: 0,
-        vy: 0,
-        vz: 0,
-        ground: true,
-        moving: false,
-        avatar: {
-          bodyColor: String(msg.avatar?.bodyColor || '#9fa1d6').slice(0, 16),
-          headItem: msg.avatar?.headItem || null,
-          backItem: msg.avatar?.backItem || null,
-        },
-      };
-
-      clients.set(clientId, { ws, player, isOwner: false, failedAuth: 0 });
-
-      sendTo(ws, {
-        type: 'welcome',
-        playerId: clientId,
-        username: player.username,
-        serverInfo: getServerInfo(),
-        worlds: WORLDS,
-        worldState: {
-          worldId,
-          players: getWorldPlayers(worldId),
-          placedBlocks: [...(worldBlocks.get(worldId)?.values() || [])],
-          tagHolderId: tagHolders.get(worldId) || null,
-        },
-        chatHistory,
-      });
-
-      broadcastWorld(worldId, { type: 'player:joined', player }, clientId);
-      broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
-      pushChat('Server', player.username + ' joined the server.', true);
-      assignTagIfNeeded(worldId);
+    if (!clientId) {
+      if (msg.type === 'auth:signup') {
+        const cleanName = cleanAccountUsername(msg.username);
+        const password = typeof msg.password === 'string' ? msg.password : '';
+        if (!cleanName) return sendTo(ws, { type: 'auth:error', message: 'Username must be 2-18 letters, numbers, spaces, _ or -.' });
+        if (password.length < 4 || password.length > 100) return sendTo(ws, { type: 'auth:error', message: 'Password must be at least 4 characters.' });
+        const accKey = cleanName.toLowerCase();
+        if (accounts.has(accKey)) return sendTo(ws, { type: 'auth:error', message: 'Username already exists on this server. Log in instead!' });
+        const sessionToken = crypto.randomBytes(24).toString('hex');
+        const acc = {
+          username: cleanName,
+          passwordHash: hashPassword(password),
+          robux: STARTING_BALANCE,
+          ownedItems: [],
+          avatar: { bodyColor: '#9fa1d6', headItem: null, backItem: null },
+          createdAt: Date.now(),
+          sessionHashes: [hashToken(sessionToken)],
+        };
+        accounts.set(accKey, acc);
+        saveAccounts();
+        completeLogin(accKey, acc, sessionToken, msg.worldId);
+        return;
+      }
+      if (msg.type === 'auth:login') {
+        if (socketFailedAuth >= 8) return sendTo(ws, { type: 'auth:error', message: 'Too many failed login attempts.' });
+        const cleanName = cleanAccountUsername(msg.username);
+        const password = typeof msg.password === 'string' ? msg.password : '';
+        const accKey = cleanName ? cleanName.toLowerCase() : '';
+        const acc = accKey ? accounts.get(accKey) : undefined;
+        if (!acc || !verifyPassword(password, acc.passwordHash)) {
+          socketFailedAuth++;
+          return sendTo(ws, { type: 'auth:error', message: 'Invalid username or password for this server.' });
+        }
+        socketFailedAuth = 0;
+        const sessionToken = crypto.randomBytes(24).toString('hex');
+        acc.sessionHashes = [...acc.sessionHashes.slice(-3), hashToken(sessionToken)];
+        saveAccounts();
+        completeLogin(accKey, acc, sessionToken, msg.worldId);
+        return;
+      }
+      if (msg.type === 'auth:session') {
+        const token = typeof msg.token === 'string' ? msg.token : '';
+        if (!token) return sendTo(ws, { type: 'auth:error', message: 'Please sign in or sign up.', clearToken: true });
+        const th = hashToken(token);
+        for (const [accKey, acc] of accounts.entries()) {
+          if (acc.sessionHashes.includes(th)) {
+            completeLogin(accKey, acc, token, msg.worldId);
+            return;
+          }
+        }
+        sendTo(ws, { type: 'auth:error', message: 'Session expired or not found on this server.', clearToken: true });
+        return;
+      }
       return;
     }
 
-    if (!clientId || !clients.has(clientId)) return;
+    if (!clients.has(clientId)) return;
     const client = clients.get(clientId);
     const player = client.player;
+    const account = accounts.get(client.accountKey);
+    if (!account) return;
+
+    if (msg.type === 'auth:logout') {
+      const oldId = clientId;
+      clientId = null;
+      clients.delete(oldId);
+      if (typeof msg.token === 'string' && msg.token) {
+        const th = hashToken(msg.token);
+        account.sessionHashes = account.sessionHashes.filter((h) => h !== th);
+        saveAccounts();
+      }
+      broadcastWorld(player.worldId, { type: 'player:left', id: oldId });
+      broadcastAll({ type: 'server:info', serverInfo: getServerInfo() });
+      pushChat('Server', player.username + ' logged out.', true);
+      assignTagIfNeeded(player.worldId);
+      sendTo(ws, { type: 'auth:required', serverInfo: getServerInfo(), clearToken: true });
+      return;
+    }
 
     if (msg.type === 'player:move') {
       player.x = Number(msg.x) || 0;
@@ -260,16 +414,38 @@ wss.on('connection', (ws) => {
       player.moving = Boolean(msg.moving);
       broadcastWorld(player.worldId, { type: 'player:moved', player }, clientId);
     } else if (msg.type === 'player:avatar') {
-      player.avatar = {
-        bodyColor: String(msg.avatar?.bodyColor || '#9fa1d6').slice(0, 16),
-        headItem: msg.avatar?.headItem || null,
-        backItem: msg.avatar?.backItem || null,
-      };
+      const nextAvatar = sanitizeAvatar(msg.avatar, account.ownedItems);
+      account.avatar = nextAvatar;
+      player.avatar = nextAvatar;
+      saveAccounts();
+      sendTo(ws, { type: 'account:update', account: toPublicAccount(account) });
       broadcastWorld(
         player.worldId,
         { type: 'player:avatar', id: clientId, avatar: player.avatar },
         clientId
       );
+    } else if (msg.type === 'shop:buy') {
+      const item = CATALOG_META.find((i) => i.id === String(msg.itemId || ''));
+      if (!item) return sendTo(ws, { type: 'error', message: 'Item not found.' });
+      if (account.ownedItems.includes(item.id)) return sendTo(ws, { type: 'error', message: 'Already owned.' });
+      if (account.robux < item.price) return sendTo(ws, { type: 'error', message: 'Not enough R$.' });
+      account.robux -= item.price;
+      account.ownedItems.push(item.id);
+      if (item.slot === 'head') account.avatar.headItem = item.id;
+      else account.avatar.backItem = item.id;
+      player.avatar = { ...account.avatar };
+      saveAccounts();
+      sendTo(ws, { type: 'account:update', account: toPublicAccount(account), notice: 'Purchased ' + item.name + ' for ' + item.price + ' R$!' });
+      broadcastWorld(player.worldId, { type: 'player:avatar', id: clientId, avatar: player.avatar }, clientId);
+    } else if (msg.type === 'obby:finish') {
+      const w = WORLDS.find((x) => x.id === player.worldId);
+      if (!w || w.mode !== 'obby') return;
+      const now = Date.now();
+      if (now - client.lastObbyRewardAt < 45000) return;
+      client.lastObbyRewardAt = now;
+      account.robux += 50;
+      saveAccounts();
+      sendTo(ws, { type: 'account:update', account: toPublicAccount(account), notice: '+50 R$ reward for finishing ' + w.name + '!' });
     } else if (msg.type === 'world:switch') {
       const target = WORLDS.find((w) => w.id === msg.worldId);
       if (!target) return;
