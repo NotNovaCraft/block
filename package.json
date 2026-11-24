@@ -1,6 +1,6 @@
 {
   "name": "nova-s-blocks-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Standalone multiplayer server for Blocks",
   "type": "module",
   "main": "server.js",
