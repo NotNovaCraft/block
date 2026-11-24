@@ -1,0 +1,118 @@
+{
+  "id": "tag-arena",
+  "name": "Block Tag Arena",
+  "description": "Bump into players to pass the IT tag across multi-tier ramps.",
+  "mode": "tag",
+  "skyColor": "#7ca7d9",
+  "fogColor": "#b5cde8",
+  "accentColor": "#ff5468",
+  "spawn": [
+    0,
+    0.7,
+    22
+  ],
+  "hasBaseplate": true,
+  "author": "Blocks",
+  "boxes": [
+    {
+      "x": 0,
+      "y": 0,
+      "z": -36,
+      "w": 72,
+      "h": 8,
+      "d": 3,
+      "color": "#384158"
+    },
+    {
+      "x": 0,
+      "y": 0,
+      "z": 36,
+      "w": 72,
+      "h": 8,
+      "d": 3,
+      "color": "#384158"
+    },
+    {
+      "x": -36,
+      "y": 0,
+      "z": 0,
+      "w": 3,
+      "h": 8,
+      "d": 72,
+      "color": "#384158"
+    },
+    {
+      "x": 36,
+      "y": 0,
+      "z": 0,
+      "w": 3,
+      "h": 8,
+      "d": 72,
+      "color": "#384158"
+    },
+    {
+      "x": 0,
+      "y": 0,
+      "z": 0,
+      "w": 18,
+      "h": 1.3,
+      "d": 18,
+      "color": "#4c7dff"
+    },
+    {
+      "x": 0,
+      "y": 1.3,
+      "z": 0,
+      "w": 12,
+      "h": 1.3,
+      "d": 12,
+      "color": "#5c89ff"
+    },
+    {
+      "x": 0,
+      "y": 2.6,
+      "z": 0,
+      "w": 6,
+      "h": 1.3,
+      "d": 6,
+      "color": "#ffc933"
+    },
+    {
+      "x": -18,
+      "y": 0,
+      "z": -18,
+      "w": 8,
+      "h": 4,
+      "d": 8,
+      "color": "#ff6b6b"
+    },
+    {
+      "x": 18,
+      "y": 0,
+      "z": -18,
+      "w": 8,
+      "h": 4,
+      "d": 8,
+      "color": "#38d27a"
+    },
+    {
+      "x": -18,
+      "y": 0,
+      "z": 18,
+      "w": 8,
+      "h": 4,
+      "d": 8,
+      "color": "#ffb347"
+    },
+    {
+      "x": 18,
+      "y": 0,
+      "z": 18,
+      "w": 8,
+      "h": 4,
+      "d": 8,
+      "color": "#a06cff"
+    }
+  ],
+  "projectFile": "tag-arena.json"
+}

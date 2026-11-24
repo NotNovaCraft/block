@@ -1,0 +1,64 @@
+{
+  "id": "baseplate",
+  "name": "Baseplate",
+  "description": "Classic flat studio baseplate for hanging out and exploring.",
+  "mode": "sandbox",
+  "skyColor": "#87b9e8",
+  "fogColor": "#b4d0ea",
+  "accentColor": "#4c7dff",
+  "spawn": [
+    0,
+    0.7,
+    0
+  ],
+  "hasBaseplate": true,
+  "author": "Blocks",
+  "boxes": [
+    {
+      "x": 0,
+      "y": 0,
+      "z": 0,
+      "w": 12,
+      "h": 0.6,
+      "d": 12,
+      "color": "#4c5368"
+    },
+    {
+      "x": 14,
+      "y": 0,
+      "z": -10,
+      "w": 4.5,
+      "h": 4.5,
+      "d": 4.5,
+      "color": "#4c7dff"
+    },
+    {
+      "x": 18.5,
+      "y": 0,
+      "z": -10,
+      "w": 4.5,
+      "h": 9,
+      "d": 4.5,
+      "color": "#38d27a"
+    },
+    {
+      "x": -15,
+      "y": 0,
+      "z": 12,
+      "w": 6,
+      "h": 3,
+      "d": 6,
+      "color": "#ffb347"
+    },
+    {
+      "x": -15,
+      "y": 3,
+      "z": 12,
+      "w": 3,
+      "h": 3,
+      "d": 3,
+      "color": "#ff6b6b"
+    }
+  ],
+  "projectFile": "baseplate.json"
+}
